@@ -24,7 +24,10 @@ using namespace std;
 using pfasst::encap::Encapsulation;
 using pfasst::encap::as_vector;
 
-#include "fft.hpp"
+#include <pfasst/encap/vector.hpp>
+
+#include "fft_manager.hpp"
+#include "fftw_workspace_dft1d.hpp"
 
 #ifndef PI
 #define PI 3.1415926535897932385
@@ -44,8 +47,9 @@ namespace pfasst
      * This directory contains several implementations of an advection/diffusion solver using the
      * PFASST framework.
      *
-     * All of the solvers use the SDC sweeper defined in `advection_diffusion_sweeper.hpp`, and the FFT
-     * routines in `fft.hpp`.
+     * All of the solvers use the SDC sweeper defined in `advection_diffusion_sweeper.hpp`.
+     *
+     * The FFT parts can can be found in `fftw_manager.hpp` and `fftw_workspace.hpp`.
      *
      * The implementations are, in order of complexity:
      *
@@ -89,9 +93,11 @@ namespace pfasst
             pfasst::log::add_custom_logger("Advec");
           }
 
+          using data_type = pfasst::encap::VectorEncapsulation<double>;
+
         private:
           //! @{
-          FFT fft;
+          FFTManager<FFTWWorkspaceDFT1D<data_type>> _fft;
           vector<complex<double>> ddx, lap;
           //! @}
 
@@ -124,7 +130,7 @@ namespace pfasst
 
           virtual ~AdvectionDiffusionSweeper()
           {
-            CLOG(INFO, "Advec") << "number of f1 evals: " << this->nf1evals;
+            ML_CLOG(INFO, "Advec", "number of f1 evals: " << this->nf1evals);
           }
           //! @}
 
@@ -134,7 +140,7 @@ namespace pfasst
             this->exact(as_vector<double, time>(q), t);
           }
 
-          void exact(DVectorT& q, time t)
+          void exact(data_type& q, time t)
           {
             size_t n = q.size();
             double a = 1.0 / sqrt(4 * PI * nu * (t + t0));
@@ -151,10 +157,10 @@ namespace pfasst
             }
           }
 
-          void echo_error(time t, bool predict = false)
+          void echo_error(time t)
           {
             auto& qend = as_vector<double, time>(this->get_end_state());
-            DVectorT qex(qend.size());
+            data_type qex(qend.size());
 
             this->exact(qex, t);
 
@@ -177,7 +183,7 @@ namespace pfasst
             for (size_t m = 0; m < this->get_nodes().size(); m++) {
                 residuals.push_back(this->get_factory()->create(pfasst::encap::solution));
             }
-            this->residual(this->get_controller()->get_time_step(), residuals);
+            this->residual(this->get_controller()->get_step_size(), residuals);
 
             vector<time> rnorms;
             for (auto r: residuals) {
@@ -190,7 +196,7 @@ namespace pfasst
 
             auto err = this->errors[ktype(n, k)];
 
-            CLOG(INFO, "Advec") << boost::format(this->FORMAT_STR) % (n+1) % k % this->get_nodes().size() % as_vector<double, time>(this->state[0]).size() % rmax % err;
+            ML_CLOG(INFO, "Advec", (boost::format(this->FORMAT_STR) % (n+1) % k % this->get_nodes().size() % as_vector<double, time>(this->state[0]).size() % rmax % err));
 
             this->residuals[ktype(n, k)] = rmax;
           }
@@ -213,8 +219,8 @@ namespace pfasst
           void post_predict() override
           {
             time t  = this->get_controller()->get_time();
-            time dt = this->get_controller()->get_time_step();
-            this->echo_error(t + dt, true);
+            time dt = this->get_controller()->get_step_size();
+            this->echo_error(t + dt);
             this->echo_residual();
           }
 
@@ -224,7 +230,7 @@ namespace pfasst
           void post_sweep() override
           {
             time t  = this->get_controller()->get_time();
-            time dt = this->get_controller()->get_time_step();
+            time dt = this->get_controller()->get_step_size();
             this->echo_error(t + dt);
             this->echo_residual();
           }
@@ -244,11 +250,11 @@ namespace pfasst
 
             double c = -v / double(u.size());
 
-            auto* z = this->fft.forward(u);
+            auto* z = this->_fft.get_workspace(u.size())->forward(u);
             for (size_t i = 0; i < u.size(); i++) {
               z[i] *= c * this->ddx[i];
             }
-            this->fft.backward(f_expl);
+            this->_fft.get_workspace(f_expl.size())->backward(f_expl);
 
             this->nf1evals++;
           }
@@ -266,11 +272,11 @@ namespace pfasst
 
             double c = nu / double(u.size());
 
-            auto* z = this->fft.forward(u);
+            auto* z = this->_fft.get_workspace(u.size())->forward(u);
             for (size_t i = 0; i < u.size(); i++) {
               z[i] *= c * this->lap[i];
             }
-            this->fft.backward(f_impl);
+            this->_fft.get_workspace(f_impl.size())->backward(f_impl);
           }
 
           /**
@@ -288,11 +294,11 @@ namespace pfasst
 
             double c = nu * double(dt);
 
-            auto* z = this->fft.forward(rhs);
+            auto* z = this->_fft.get_workspace(rhs.size())->forward(rhs);
             for (size_t i = 0; i < u.size(); i++) {
               z[i] /= (1.0 - c * this->lap[i]) * double(u.size());
             }
-            this->fft.backward(u);
+            this->_fft.get_workspace(u.size())->backward(u);
 
             for (size_t i = 0; i < u.size(); i++) {
               f_impl[i] = (u[i] - rhs[i]) / double(dt);
